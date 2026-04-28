@@ -183,10 +183,10 @@ print()
 if board.is_checkmate():
     winner = "белые" if board.turn == chess.BLACK else "черные"
     if (winner == "белые" and human_is_white) or (winner == "черные" and not human_is_white):
-        print("🎉 ВЫ ПОБЕДИЛИ! 🎉")
+        print(" ВЫ ПОБЕДИЛИ! ")
     else:
-        print("🤖 ДВИЖОК ПОБЕДИЛ! 🤖")
+        print(" ДВИЖОК ПОБЕДИЛ! ")
 elif board.is_stalemate():
-    print("🤝 ПАТ - НИЧЬЯ! 🤝")
+    print("ПАТ - НИЧЬЯ! ")
 else:
     print("Игра завершена!")
