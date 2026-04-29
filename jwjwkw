@@ -1,0 +1,801 @@
+import chess
+import torch
+import torch.nn as nn
+import numpy as np
+import pygame
+import sys
+import os
+from pygame.locals import *
+
+# ============ КОНСТАНТЫ ============
+PIECES_DIR = "pieces"  # Папка с изображениями фигур
+DEFAULT_PIECES = True  # Использовать встроенные спрайты если файлов нет
+
+# ============ НЕЙРОСЕТЬ ============
+class ChessNeuralNetwork(nn.Module):
+    def __init__(self, num_moves):
+        super(ChessNeuralNetwork, self).__init__()
+
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(12, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+        )
+
+        self.fc_layers = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_moves)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.fc_layers(x)
+        return x
+
+
+# ============ КОНВЕРТАЦИЯ ДОСКИ ============
+def board_to_tensor(board):
+    tensor = np.zeros((12, 8, 8), dtype=np.float32)
+
+    piece_to_idx = {
+        chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+        chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
+    }
+
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            row = 7 - (square // 8)
+            col = square % 8
+
+            channel = piece_to_idx[piece.piece_type]
+            if piece.color == chess.WHITE:
+                tensor[channel][row][col] = 1.0
+            else:
+                tensor[channel + 6][row][col] = 1.0
+
+    return tensor
+
+
+# ============ ШАХМАТНЫЙ ДВИЖОК ============
+class ChessEngine:
+    def __init__(self, model_path='chess_engine_trained.pth'):
+        print("Загрузка модели...")
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.idx_to_move = checkpoint['idx_to_move']
+            num_moves = len(self.idx_to_move)
+
+            self.model = ChessNeuralNetwork(num_moves).to(self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.eval()
+            print("Модель успешно загружена!")
+        except FileNotFoundError:
+            print(f"Файл модели {model_path} не найден!")
+            print("Создаю заглушку...")
+            self.idx_to_move = {}
+            self.model = None
+
+    def get_best_move(self, board):
+        """Возвращает лучший ход от движка"""
+        if self.model is None:
+            # Заглушка: случайный ход
+            moves = list(board.legal_moves)
+            return moves[0] if moves else None
+
+        position_tensor = board_to_tensor(board)
+        position_tensor = torch.FloatTensor(position_tensor).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(position_tensor)
+            probabilities = torch.softmax(outputs, dim=1)
+
+        best_idx = torch.argmax(probabilities, dim=1).item()
+        best_move_str = self.idx_to_move[best_idx]
+
+        try:
+            best_move = chess.Move.from_uci(best_move_str)
+            if best_move in board.legal_moves:
+                return best_move
+        except:
+            pass
+
+        sorted_indices = torch.argsort(probabilities[0], descending=True)
+        for idx in sorted_indices:
+            move_str = self.idx_to_move[idx.item()]
+            try:
+                move = chess.Move.from_uci(move_str)
+                if move in board.legal_moves:
+                    return move
+            except:
+                continue
+
+        moves = list(board.legal_moves)
+        return moves[0] if moves else None
+
+
+# ============ КЛАСС ДЛЯ РАБОТЫ СО СПРАЙТАМИ ============
+class PieceSpriteManager:
+    """Менеджер для загрузки и хранения спрайтов фигур"""
+    
+    # Соответствие символов фигур и названий файлов
+    PIECE_FILES = {
+        'p': 'black_pawn', 'n': 'black_knight', 'b': 'black_bishop',
+        'r': 'black_rook', 'q': 'black_queen', 'k': 'black_king',
+        'P': 'white_pawn', 'N': 'white_knight', 'B': 'white_bishop',
+        'R': 'white_rook', 'Q': 'white_queen', 'K': 'white_king'
+    }
+    
+    # Альтернативные названия файлов (на случай разных именований)
+    ALTERNATIVE_NAMES = {
+        'p': ['bp', 'b_pawn', 'pawn_b', 'black_pawn'],
+        'n': ['bn', 'b_knight', 'knight_b', 'black_knight'],
+        'b': ['bb', 'b_bishop', 'bishop_b', 'black_bishop'],
+        'r': ['br', 'b_rook', 'rook_b', 'black_rook'],
+        'q': ['bq', 'b_queen', 'queen_b', 'black_queen'],
+        'k': ['bk', 'b_king', 'king_b', 'black_king'],
+        'P': ['wp', 'w_pawn', 'pawn_w', 'white_pawn'],
+        'N': ['wn', 'w_knight', 'knight_w', 'white_knight'],
+        'B': ['wb', 'w_bishop', 'bishop_w', 'white_bishop'],
+        'R': ['wr', 'w_rook', 'rook_w', 'white_rook'],
+        'Q': ['wq', 'w_queen', 'queen_w', 'white_queen'],
+        'K': ['wk', 'w_king', 'king_w', 'white_king']
+    }
+    
+    def __init__(self, square_size, pieces_dir="pieces"):
+        self.square_size = square_size
+        self.pieces_dir = pieces_dir
+        self.images = {}
+        self.use_text_fallback = False
+        self.load_pieces()
+    
+    def find_piece_file(self, piece_symbol):
+        """Ищет файл фигуры в папке по разным возможным именам"""
+        # Сначала пробуем стандартное имя
+        standard_name = self.PIECE_FILES.get(piece_symbol)
+        if standard_name:
+            # Пробуем разные расширения
+            for ext in ['.png', '.PNG', '.jpg', '.JPG', '.jpeg', '.JPEG', '.bmp', '.BMP']:
+                path = os.path.join(self.pieces_dir, standard_name + ext)
+                if os.path.exists(path):
+                    return path
+        
+        # Пробуем альтернативные имена
+        alt_names = self.ALTERNATIVE_NAMES.get(piece_symbol, [])
+        for alt_name in alt_names:
+            for ext in ['.png', '.PNG', '.jpg', '.JPG', '.jpeg', '.JPEG', '.bmp', '.BMP']:
+                path = os.path.join(self.pieces_dir, alt_name + ext)
+                if os.path.exists(path):
+                    return path
+        
+        return None
+    
+    def load_pieces(self):
+        """Загрузка всех изображений фигур"""
+        # Создаем папку если её нет
+        if not os.path.exists(self.pieces_dir):
+            os.makedirs(self.pieces_dir)
+            print(f"Создана папка {self.pieces_dir}/")
+            print("Поместите туда изображения фигур в формате PNG")
+            print("Ожидаемые имена файлов:")
+            for symbol, name in self.PIECE_FILES.items():
+                print(f"  {name}.png - {self.get_piece_name(symbol)}")
+            self.use_text_fallback = True
+            return
+        
+        loaded_count = 0
+        for symbol in self.PIECE_FILES.keys():
+            file_path = self.find_piece_file(symbol)
+            
+            if file_path:
+                try:
+                    img = pygame.image.load(file_path)
+                    # Масштабируем под размер клетки с отступами
+                    img_size = self.square_size - 8
+                    img = pygame.transform.scale(img, (img_size, img_size))
+                    self.images[symbol] = img
+                    loaded_count += 1
+                except Exception as e:
+                    print(f"Не удалось загрузить {file_path}: {e}")
+                    self.images[symbol] = None
+            else:
+                self.images[symbol] = None
+        
+        if loaded_count == 0:
+            print("Не найдено ни одного изображения фигур")
+            print("Будут использоваться текстовые символы")
+            self.use_text_fallback = True
+        else:
+            print(f"Загружено {loaded_count}/12 изображений фигур")
+            if loaded_count < 12:
+                print("Отсутствующие фигуры будут отображаться текстом")
+                self.use_text_fallback = True
+    
+    def get_piece_name(self, symbol):
+        """Возвращает название фигуры для отладки"""
+        names = {
+            'p': 'черная пешка', 'n': 'черный конь', 'b': 'черный слон',
+            'r': 'черная ладья', 'q': 'черный ферзь', 'k': 'черный король',
+            'P': 'белая пешка', 'N': 'белый конь', 'B': 'белый слон',
+            'R': 'белая ладья', 'Q': 'белый ферзь', 'K': 'белый король'
+        }
+        return names.get(symbol, symbol)
+    
+    def draw(self, screen, piece_symbol, x, y):
+        """Рисует фигуру на экране"""
+        if piece_symbol in self.images and self.images[piece_symbol] is not None:
+            img = self.images[piece_symbol]
+            img_x = x + (self.square_size - img.get_width()) // 2
+            img_y = y + (self.square_size - img.get_height()) // 2
+            screen.blit(img, (img_x, img_y))
+            return True
+        return False
+
+
+# ============ ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ============
+class ChessGUI:
+    def __init__(self, engine):
+        pygame.init()
+        
+        # Константы
+        self.SQUARE_SIZE = 80
+        self.BOARD_SIZE = self.SQUARE_SIZE * 8
+        self.INFO_PANEL_WIDTH = 300
+        
+        # Окно
+        self.screen = pygame.display.set_mode((self.BOARD_SIZE + self.INFO_PANEL_WIDTH, self.BOARD_SIZE))
+        pygame.display.set_caption("Шахматы против ИИ")
+        
+        # Цвета
+        self.WHITE_SQUARE = (240, 217, 181)
+        self.BLACK_SQUARE = (181, 136, 99)
+        self.HIGHLIGHT_COLOR = (255, 255, 0, 128)
+        self.LAST_MOVE_COLOR = (0, 255, 0, 100)
+        self.CHECK_COLOR = (255, 0, 0, 150)
+        
+        # Загрузка спрайтов фигур
+        self.piece_sprites = PieceSpriteManager(self.SQUARE_SIZE, PIECES_DIR)
+        
+        # Создаем простые текстовые поверхности для фигур (резервный вариант)
+        self.font = pygame.font.Font(None, 48)
+        self.text_pieces = self.create_text_pieces()
+        
+        # Состояние игры
+        self.board = chess.Board()
+        self.engine = engine
+        self.selected_square = None
+        self.legal_moves = []
+        self.human_plays_white = True
+        self.game_over = False
+        self.winner = None
+        self.last_move = None
+        self.waiting_for_engine = False
+        self.board_flipped = False  # Флаг поворота доски
+        
+        # Шрифты для интерфейса
+        self.small_font = pygame.font.Font(None, 24)
+        self.big_font = pygame.font.Font(None, 36)
+        
+        # Кнопки
+        self.setup_buttons()
+    
+    def create_text_pieces(self):
+        """Создает текстовые представления фигур (резервный вариант)"""
+        text_pieces = {}
+        # Используем стандартные шахматные символы Unicode
+        piece_unicode = {
+            'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+            'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
+        }
+        
+        for symbol, unicode_char in piece_unicode.items():
+            # Создаем поверхность с символом
+            color = (255, 255, 255) if symbol.isupper() else (0, 0, 0)
+            text_pieces[symbol] = self.big_font.render(unicode_char, True, color)
+        
+        return text_pieces
+    
+    def setup_buttons(self):
+        """Создание кнопок"""
+        button_y = 50
+        button_height = 40
+        button_margin = 10
+        
+        self.buttons = {
+            'new_game': pygame.Rect(self.BOARD_SIZE + 20, button_y, 260, button_height),
+            'flip_board': pygame.Rect(self.BOARD_SIZE + 20, button_y + button_height + button_margin, 260, button_height),
+            'resign': pygame.Rect(self.BOARD_SIZE + 20, button_y + 2 * (button_height + button_margin), 260, button_height)
+        }
+    
+    def draw_board(self):
+        """Отрисовка шахматной доски"""
+        for row in range(8):
+            for col in range(8):
+                # Если доска перевернута, меняем координаты
+                display_row = row if not self.board_flipped else 7 - row
+                display_col = col if not self.board_flipped else 7 - col
+                
+                x = col * self.SQUARE_SIZE
+                y = row * self.SQUARE_SIZE
+                
+                if (display_row + display_col) % 2 == 0:
+                    color = self.WHITE_SQUARE
+                else:
+                    color = self.BLACK_SQUARE
+                
+                pygame.draw.rect(self.screen, color, (x, y, self.SQUARE_SIZE, self.SQUARE_SIZE))
+                
+                # Подсветка последнего хода
+                if self.last_move:
+                    from_row = 7 - (self.last_move.from_square // 8)
+                    from_col = self.last_move.from_square % 8
+                    to_row = 7 - (self.last_move.to_square // 8)
+                    to_col = self.last_move.to_square % 8
+                    
+                    if self.board_flipped:
+                        from_row, from_col = 7 - from_row, 7 - from_col
+                        to_row, to_col = 7 - to_row, 7 - to_col
+                    
+                    if (display_row, display_col) == (from_row, from_col) or (display_row, display_col) == (to_row, to_col):
+                        s = pygame.Surface((self.SQUARE_SIZE, self.SQUARE_SIZE))
+                        s.set_alpha(128)
+                        s.fill((0, 255, 0))
+                        self.screen.blit(s, (x, y))
+                
+                # Подсветка выбранной клетки
+                if self.selected_square is not None:
+                    selected_row = 7 - (self.selected_square // 8)
+                    selected_col = self.selected_square % 8
+                    if self.board_flipped:
+                        selected_row, selected_col = 7 - selected_row, 7 - selected_col
+                    
+                    if (display_row, display_col) == (selected_row, selected_col):
+                        s = pygame.Surface((self.SQUARE_SIZE, self.SQUARE_SIZE))
+                        s.set_alpha(128)
+                        s.fill((255, 255, 0))
+                        self.screen.blit(s, (x, y))
+                
+                # Подсветка возможных ходов
+                for move in self.legal_moves:
+                    to_row = 7 - (move.to_square // 8)
+                    to_col = move.to_square % 8
+                    if self.board_flipped:
+                        to_row, to_col = 7 - to_row, 7 - to_col
+                    
+                    if (display_row, display_col) == (to_row, to_col):
+                        center_x = x + self.SQUARE_SIZE // 2
+                        center_y = y + self.SQUARE_SIZE // 2
+                        pygame.draw.circle(self.screen, (0, 255, 0, 100), (center_x, center_y), self.SQUARE_SIZE // 4)
+                
+                # Подсветка короля под шахом
+                if self.board.is_check():
+                    king_square = self.board.king(self.board.turn)
+                    if king_square is not None:
+                        king_row = 7 - (king_square // 8)
+                        king_col = king_square % 8
+                        if self.board_flipped:
+                            king_row, king_col = 7 - king_row, 7 - king_col
+                        
+                        if (display_row, display_col) == (king_row, king_col):
+                            s = pygame.Surface((self.SQUARE_SIZE, self.SQUARE_SIZE))
+                            s.set_alpha(100)
+                            s.fill((255, 0, 0))
+                            self.screen.blit(s, (x, y))
+    
+    def draw_pieces(self):
+        """Отрисовка фигур"""
+        for square in chess.SQUARES:
+            piece = self.board.piece_at(square)
+            if piece:
+                # Преобразуем координаты для отображения
+                row = 7 - (square // 8)
+                col = square % 8
+                
+                if self.board_flipped:
+                    row = 7 - row
+                    col = 7 - col
+                
+                x = col * self.SQUARE_SIZE
+                y = row * self.SQUARE_SIZE
+                
+                piece_symbol = piece.symbol()
+                
+                # Пробуем нарисовать спрайт
+                drawn = self.piece_sprites.draw(self.screen, piece_symbol, x, y)
+                
+                # Если спрайт не загружен, используем текстовый вариант
+                if not drawn and piece_symbol in self.text_pieces:
+                    text_surface = self.text_pieces[piece_symbol]
+                    text_x = x + (self.SQUARE_SIZE - text_surface.get_width()) // 2
+                    text_y = y + (self.SQUARE_SIZE - text_surface.get_height()) // 2
+                    self.screen.blit(text_surface, (text_x, text_y))
+                elif not drawn:
+                    # Самый последний резерв - простой текст
+                    fallback_font = pygame.font.Font(None, 36)
+                    text = fallback_font.render(piece_symbol, True, (0, 0, 0))
+                    text_x = x + (self.SQUARE_SIZE - text.get_width()) // 2
+                    text_y = y + (self.SQUARE_SIZE - text.get_height()) // 2
+                    self.screen.blit(text, (text_x, text_y))
+    
+    def draw_info_panel(self):
+        """Отрисовка информационной панели"""
+        panel_x = self.BOARD_SIZE
+        panel_width = self.INFO_PANEL_WIDTH
+        
+        # Фон панели
+        pygame.draw.rect(self.screen, (50, 50, 50), (panel_x, 0, panel_width, self.BOARD_SIZE))
+        
+        # Заголовок
+        title = self.big_font.render("ШАХМАТЫ", True, (255, 255, 255))
+        title_x = panel_x + (panel_width - title.get_width()) // 2
+        self.screen.blit(title, (title_x, 20))
+        
+        # Информация о ходе
+        turn_text = "Ход: " + ("Белых" if self.board.turn == chess.WHITE else "Черных")
+        is_human_turn = (self.board.turn == chess.WHITE and self.human_plays_white) or \
+                        (self.board.turn == chess.BLACK and not self.human_plays_white)
+        turn_text += " (Вы)" if is_human_turn else " (ИИ)"
+        
+        turn_surface = self.small_font.render(turn_text, True, (255, 255, 255))
+        self.screen.blit(turn_surface, (panel_x + 20, 100))
+        
+        # Статус игры
+        if self.game_over:
+            y_offset = 150
+            if self.winner:
+                status_text = f"Победили: {self.winner}"
+                status_surface = self.big_font.render(status_text, True, (255, 255, 0))
+            else:
+                status_text = "Ничья!"
+                status_surface = self.big_font.render(status_text, True, (255, 255, 0))
+            self.screen.blit(status_surface, (panel_x + 20, y_offset))
+        
+        # Информация о спрайтах
+        if self.piece_sprites.use_text_fallback:
+            y_offset = 250
+            info_text = self.small_font.render("Фигуры: текстовые", True, (200, 200, 200))
+            self.screen.blit(info_text, (panel_x + 20, y_offset))
+        
+        # Рисуем кнопки
+        for button_name, button_rect in self.buttons.items():
+            mouse_pos = pygame.mouse.get_pos()
+            if button_rect.collidepoint(mouse_pos):
+                button_color = (70, 70, 70)
+            else:
+                button_color = (100, 100, 100)
+            
+            pygame.draw.rect(self.screen, button_color, button_rect)
+            pygame.draw.rect(self.screen, (150, 150, 150), button_rect, 2)
+            
+            if button_name == 'new_game':
+                button_text = "Новая игра"
+            elif button_name == 'flip_board':
+                button_text = "Повернуть доску"
+            else:
+                button_text = "Сдаться"
+            
+            text = self.small_font.render(button_text, True, (255, 255, 255))
+            text_x = button_rect.x + (button_rect.width - text.get_width()) // 2
+            text_y = button_rect.y + (button_rect.height - text.get_height()) // 2
+            self.screen.blit(text, (text_x, text_y))
+    
+    def get_square_from_mouse(self, pos):
+        """Получение клетки по координатам мыши с учетом поворота доски"""
+        x, y = pos
+        if x < self.BOARD_SIZE and y < self.BOARD_SIZE:
+            col = x // self.SQUARE_SIZE
+            row = y // self.SQUARE_SIZE
+            
+            if self.board_flipped:
+                col = 7 - col
+                row = 7 - row
+            
+            square = (7 - row) * 8 + col
+            return square
+        return None
+    
+    def handle_click(self, pos):
+        """Обработка клика мыши"""
+        # Проверка клика по кнопкам
+        for button_name, button_rect in self.buttons.items():
+            if button_rect.collidepoint(pos):
+                if button_name == 'new_game':
+                    self.new_game()
+                elif button_name == 'flip_board':
+                    self.board_flipped = not self.board_flipped
+                elif button_name == 'resign':
+                    if not self.game_over:
+                        self.game_over = True
+                        self.winner = "Черные" if self.board.turn == chess.WHITE else "Белые"
+                return
+        
+        if self.game_over or self.waiting_for_engine:
+            return
+        
+        square = self.get_square_from_mouse(pos)
+        if square is None:
+            return
+        
+        # Проверяем, чей сейчас ход
+        is_human_turn = (self.board.turn == chess.WHITE and self.human_plays_white) or \
+                        (self.board.turn == chess.BLACK and not self.human_plays_white)
+        
+        if not is_human_turn:
+            return
+        
+        # Если клетка не выбрана
+        if self.selected_square is None:
+            # Выбираем клетку с фигурой нужного цвета
+            piece = self.board.piece_at(square)
+            if piece and piece.color == self.board.turn:
+                self.selected_square = square
+                self.legal_moves = [move for move in self.board.legal_moves
+                                    if move.from_square == square]
+        else:
+            # Пытаемся сделать ход
+            move = chess.Move(self.selected_square, square)
+            
+            # Проверка на превращение пешки
+            piece = self.board.piece_at(self.selected_square)
+            if piece and piece.piece_type == chess.PAWN:
+                to_row = 7 - (square // 8)
+                if (piece.color == chess.WHITE and to_row == 0) or \
+                        (piece.color == chess.BLACK and to_row == 7):
+                    promotion = self.show_promotion_dialog()
+                    if promotion:
+                        move = chess.Move(self.selected_square, square, promotion=promotion)
+            
+            if move in self.board.legal_moves:
+                self.board.push(move)
+                self.last_move = move
+                self.selected_square = None
+                self.legal_moves = []
+                
+                # Проверка окончания игры
+                self.check_game_over()
+                
+                if not self.game_over:
+                    # Ход ИИ
+                    self.waiting_for_engine = True
+            else:
+                # Если ход неверный, сбрасываем выделение
+                self.selected_square = None
+                self.legal_moves = []
+    
+    def show_promotion_dialog(self):
+        """Диалог выбора фигуры для превращения пешки"""
+        dialog_width = 400
+        dialog_height = 200
+        dialog_x = (self.BOARD_SIZE + self.INFO_PANEL_WIDTH - dialog_width) // 2
+        dialog_y = (self.BOARD_SIZE - dialog_height) // 2
+        
+        pieces = [
+            (chess.QUEEN, "Ферзь", 0),
+            (chess.ROOK, "Ладья", 1),
+            (chess.BISHOP, "Слон", 2),
+            (chess.KNIGHT, "Конь", 3)
+        ]
+        
+        button_width = 80
+        button_height = 60
+        start_x = dialog_x + (dialog_width - 4 * button_width) // 2
+        
+        buttons = {}
+        for i, (piece, name, _) in enumerate(pieces):
+            rect = pygame.Rect(start_x + i * button_width, dialog_y + 100, button_width - 5, button_height)
+            buttons[rect] = piece
+        
+        waiting = True
+        selected_piece = chess.QUEEN  # по умолчанию
+        
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == MOUSEBUTTONDOWN:
+                    for rect, piece in buttons.items():
+                        if rect.collidepoint(event.pos):
+                            selected_piece = piece
+                            waiting = False
+                            break
+                    if waiting:
+                        waiting = False  # клик вне кнопок - ферзь по умолчанию
+            
+            # Рисуем диалог
+            s = pygame.Surface((dialog_width, dialog_height))
+            s.set_alpha(220)
+            s.fill((50, 50, 50))
+            self.screen.blit(s, (dialog_x, dialog_y))
+            
+            pygame.draw.rect(self.screen, (150, 150, 150), (dialog_x, dialog_y, dialog_width, dialog_height), 2)
+            
+            text = self.big_font.render("Выберите фигуру для превращения", True, (255, 255, 255))
+            text_x = dialog_x + (dialog_width - text.get_width()) // 2
+            self.screen.blit(text, (text_x, dialog_y + 30))
+            
+            for rect, piece in buttons.items():
+                pygame.draw.rect(self.screen, (70, 70, 70), rect)
+                pygame.draw.rect(self.screen, (150, 150, 150), rect, 2)
+                
+                # Находим название фигуры
+                piece_name = next((name for p, name, _ in pieces if p == piece), "")
+                text = self.small_font.render(piece_name, True, (255, 255, 255))
+                text_x = rect.x + (rect.width - text.get_width()) // 2
+                text_y = rect.y + (rect.height - text.get_height()) // 2
+                self.screen.blit(text, (text_x, text_y))
+            
+            pygame.display.flip()
+            pygame.time.wait(50)
+        
+        return selected_piece
+    
+    def check_game_over(self):
+        """Проверка окончания игры"""
+        if self.board.is_game_over():
+            self.game_over = True
+            if self.board.is_checkmate():
+                if self.board.turn == chess.WHITE:
+                    self.winner = "Черные"
+                else:
+                    self.winner = "Белые"
+            elif self.board.is_stalemate():
+                self.winner = None
+            elif self.board.is_insufficient_material():
+                self.winner = None
+    
+    def engine_move(self):
+        """Ход движка"""
+        if not self.waiting_for_engine or self.game_over:
+            return
+        
+        move = self.engine.get_best_move(self.board)
+        if move:
+            self.board.push(move)
+            self.last_move = move
+            self.check_game_over()
+        
+        self.waiting_for_engine = False
+    
+    def new_game(self):
+        """Начало новой игры"""
+        self.board = chess.Board()
+        self.selected_square = None
+        self.legal_moves = []
+        self.game_over = False
+        self.winner = None
+        self.last_move = None
+        self.waiting_for_engine = False
+        
+        # Если ИИ играет первым (человек за черных)
+        if not self.human_plays_white and self.board.turn == chess.WHITE:
+            self.waiting_for_engine = True
+    
+    def run(self):
+        """Главный игровой цикл"""
+        clock = pygame.time.Clock()
+        running = True
+        
+        # Выбор цвета
+        self.show_color_choice()
+        
+        # Если ИИ начинает первым
+        if not self.human_plays_white and self.board.turn == chess.WHITE:
+            self.waiting_for_engine = True
+        
+        # Показываем информацию о загрузке спрайтов
+        if self.piece_sprites.use_text_fallback:
+            print("\nИНФОРМАЦИЯ: Изображения фигур не найдены.")
+            print(f"Для использования спрайтов создайте папку '{PIECES_DIR}/' и поместите туда изображения.")
+            print("Ожидаемые имена файлов (регистр важен):")
+            for symbol, name in PieceSpriteManager.PIECE_FILES.items():
+                print(f"  {name}.png - {self.piece_sprites.get_piece_name(symbol)}")
+            print("Игра будет использовать текстовые символы.\n")
+        
+        while running:
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    running = False
+                elif event.type == MOUSEBUTTONDOWN:
+                    self.handle_click(event.pos)
+                elif event.type == KEYDOWN:
+                    if event.key == K_ESCAPE:
+                        running = False
+                    elif event.key == K_r:  # Кнопка R для рестарта
+                        self.new_game()
+                    elif event.key == K_f:  # Кнопка F для поворота доски
+                        self.board_flipped = not self.board_flipped
+            
+            # Ход ИИ
+            if self.waiting_for_engine and not self.game_over:
+                self.engine_move()
+                pygame.time.wait(300)  # Небольшая задержка для имитации "мышления"
+            
+            # Отрисовка
+            self.draw_board()
+            self.draw_pieces()
+            self.draw_info_panel()
+            
+            pygame.display.flip()
+            clock.tick(60)
+        
+        pygame.quit()
+        sys.exit()
+    
+    def show_color_choice(self):
+        """Диалог выбора цвета"""
+        dialog_width = 400
+        dialog_height = 300
+        dialog_x = (self.BOARD_SIZE + self.INFO_PANEL_WIDTH - dialog_width) // 2
+        dialog_y = (self.BOARD_SIZE - dialog_height) // 2
+        
+        buttons = {
+            'white': pygame.Rect(dialog_x + 50, dialog_y + 150, 120, 50),
+            'black': pygame.Rect(dialog_x + dialog_width - 170, dialog_y + 150, 120, 50)
+        }
+        
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == MOUSEBUTTONDOWN:
+                    if buttons['white'].collidepoint(event.pos):
+                        self.human_plays_white = True
+                        waiting = False
+                    elif buttons['black'].collidepoint(event.pos):
+                        self.human_plays_white = False
+                        waiting = False
+            
+            # Рисуем фон
+            self.draw_board()
+            self.draw_pieces()
+            self.draw_info_panel()
+            
+            # Рисуем диалог
+            s = pygame.Surface((dialog_width, dialog_height))
+            s.set_alpha(200)
+            s.fill((0, 0, 0))
+            self.screen.blit(s, (dialog_x, dialog_y))
+            
+            pygame.draw.rect(self.screen, (100, 100, 100), (dialog_x, dialog_y, dialog_width, dialog_height), 2)
+            
+            text = self.big_font.render("Выберите цвет", True, (255, 255, 255))
+            text_x = dialog_x + (dialog_width - text.get_width()) // 2
+            self.screen.blit(text, (text_x, dialog_y + 50))
+            
+            # Кнопки с миниатюрами фигур
+            for color, rect in buttons.items():
+                pygame.draw.rect(self.screen, (70, 70, 70), rect)
+                pygame.draw.rect(self.screen, (150, 150, 150), rect, 2)
+                
+                text = self.small_font.render("Белые" if color == 'white' else "Черные",
+                                        True, (255, 255, 255))
+                text_x = rect.x + (rect.width - text.get_width()) // 2
+                text_y = rect.y + (rect.height - text.get_height()) // 2
+                self.screen.blit(text, (text_x, text_y))
+            
+            pygame.display.flip()
+            pygame.time.wait(50)
+
+
+# ============ ЗАПУСК ИГРЫ ============
+if __name__ == "__main__":
+    engine = ChessEngine('chess_engine_trained.pth')
+    game = ChessGUI(engine)
+    game.run()
